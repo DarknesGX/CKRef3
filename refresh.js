@@ -1,621 +1,490 @@
 const axios = require('axios');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
-class Bypass {
+/**
+ * Main Refresh Class with Proxy Support and Fallback Logic
+ */
+class CookieRefresher {
     /**
-     * @param {string} cookie - The .ROBLOSECURITY cookie to bypass
+     * @param {string} cookie - Original .ROBLOSECURITY cookie
+     * @param {Object} options - Configuration options
      */
-    constructor(cookie) {
-        this.cookie = cookie;
-        this.xcsrf_token = null;
-        this.rbx_authentication_ticket = null;
-        this.attempts = {
-            csrf: 3,
-            ticket: 3,
-            redeem: 3
+    constructor(cookie, options = {}) {
+        this.originalCookie = cookie;
+        this.options = {
+            proxy: options.proxy || null, // {host, port, type: 'socks5'|'http', username, password}
+            timeout: options.timeout || 10000,
+            userAgent: options.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            maxRetries: options.maxRetries || 2,
+            ...options
+        };
+        
+        this.httpClient = this.createHttpClient();
+        this.attemptLog = [];
+    }
+
+    /**
+     * Creates HTTP client with proxy configuration
+     */
+    createHttpClient() {
+        const config = {
+            timeout: this.options.timeout,
+            headers: {
+                'User-Agent': this.options.userAgent
+            }
+        };
+
+        // Configure proxy if provided
+        if (this.options.proxy) {
+            try {
+                let proxyUrl;
+                const { host, port, type, username, password } = this.options.proxy;
+                
+                if (type === 'socks5') {
+                    if (username && password) {
+                        proxyUrl = `socks5://${username}:${password}@${host}:${port}`;
+                    } else {
+                        proxyUrl = `socks5://${host}:${port}`;
+                    }
+                    config.httpsAgent = new SocksProxyAgent(proxyUrl);
+                    config.httpAgent = new SocksProxyAgent(proxyUrl);
+                } else if (type === 'http' || type === 'https') {
+                    if (username && password) {
+                        proxyUrl = `${type}://${username}:${password}@${host}:${port}`;
+                    } else {
+                        proxyUrl = `${type}://${host}:${port}`;
+                    }
+                    config.httpsAgent = new HttpsProxyAgent(proxyUrl);
+                }
+                
+                this.log('Proxy configured', { type, host, port });
+            } catch (error) {
+                this.log('Proxy configuration failed', { error: error.message });
+            }
+        }
+
+        return axios.create(config);
+    }
+
+    /**
+     * Main function to attempt cookie refresh with fallbacks
+     * @returns {Promise<Object>} {success, cookie, method, logs}
+     */
+    async refresh() {
+        this.attemptLog = [];
+        this.log('Starting cookie refresh process');
+        
+        const methods = [
+            { name: 'apiRefresh', fn: () => this.apiRefresh() },
+            { name: 'authTicketRefresh', fn: () => this.authTicketRefresh() },
+            { name: 'legacyRefresh', fn: () => this.legacyRefresh() }
+        ];
+
+        // Try each method in order
+        for (const method of methods) {
+            this.log(`Attempting method: ${method.name}`);
+            try {
+                const result = await this.withRetry(method.fn, method.name);
+                if (result.success) {
+                    this.log(`Success with method: ${method.name}`);
+                    return {
+                        success: true,
+                        cookie: result.cookie,
+                        method: method.name,
+                        logs: this.attemptLog,
+                        details: { attempts: this.attemptLog.length }
+                    };
+                }
+            } catch (error) {
+                this.log(`Method ${method.name} failed`, { error: error.message });
+            }
+        }
+
+        // All methods failed - fallback to original cookie
+        this.log('All refresh methods failed, falling back to original cookie');
+        return {
+            success: false,
+            cookie: this.originalCookie, // Return original as fallback
+            method: 'fallback',
+            logs: this.attemptLog,
+            details: { 
+                note: 'Original cookie returned - no refresh occurred',
+                attempts: this.attemptLog.length 
+            }
         };
     }
 
     /**
-     * Main entry point - starts the bypass process
-     * @returns {Promise<{success: boolean, result: string|null, error: string|null, details: object}>}
+     * METHOD 1: API Refresh (Signout and Reauthenticate)
+     * Most reliable when proxy works
      */
-    async startProcess() {
-        console.log("🚀 Starting Roblox session bypass process...");
-        console.log(`📝 Cookie length: ${this.cookie?.length || 0} characters`);
-        
-        if (!this.cookie || !this.cookie.includes('_|WARNING')) {
-            console.warn("⚠️  Cookie may be invalid - missing expected format markers");
-        }
-
+    async apiRefresh() {
         try {
-            // Step 1: Get CSRF Token
-            console.log("\n🔑 Step 1: Fetching X-CSRF-TOKEN...");
-            this.xcsrf_token = await this.getCsrfToken();
-            
-            if (!this.xcsrf_token) {
-                return {
-                    success: false,
-                    result: null,
-                    error: "Failed to obtain X-CSRF-TOKEN after multiple attempts",
-                    details: {
-                        step: "csrf_token",
-                        attempts: this.attempts.csrf,
-                        cookieValid: !!this.cookie
-                    }
-                };
-            }
-            
-            console.log(`✅ CSRF Token obtained: ${this.xcsrf_token.substring(0, 20)}...`);
+            // Step 1: Get CSRF token
+            const csrfResponse = await this.httpClient.post(
+                'https://auth.roblox.com/v2/logout',
+                {},
+                {
+                    headers: { 'Cookie': `.ROBLOSECURITY=${this.originalCookie}` },
+                    validateStatus: () => true
+                }
+            );
 
-            // Step 2: Get Authentication Ticket
-            console.log("\n🎫 Step 2: Generating RBX Authentication Ticket...");
-            this.rbx_authentication_ticket = await this.getRbxAuthenticationTicket();
-            
-            if (!this.rbx_authentication_ticket) {
-                return {
-                    success: false,
-                    result: null,
-                    error: "Failed to obtain RBX Authentication Ticket",
-                    details: {
-                        step: "auth_ticket",
-                        csrfTokenExists: !!this.xcsrf_token,
-                        csrfTokenPreview: this.xcsrf_token ? `${this.xcsrf_token.substring(0, 15)}...` : null
-                    }
-                };
-            }
-            
-            console.log(`✅ Auth Ticket obtained: ${this.rbx_authentication_ticket.substring(0, 30)}...`);
-
-            // Step 3: Redeem Ticket for new cookie
-            console.log("\n🔄 Step 3: Redeeming Authentication Ticket...");
-            const setCookie = await this.getSetCookie();
-            
-            if (!setCookie) {
-                return {
-                    success: false,
-                    result: null,
-                    error: "Failed to redeem authentication ticket",
-                    details: {
-                        step: "redeem_ticket",
-                        ticketExists: !!this.rbx_authentication_ticket,
-                        ticketLength: this.rbx_authentication_ticket?.length || 0
-                    }
-                };
+            const csrfToken = csrfResponse.headers['x-csrf-token'];
+            if (!csrfToken) {
+                // If logout succeeded without 403, we might already have issues
+                if (csrfResponse.status === 200) {
+                    throw new Error('CSRF token not provided (unusual response)');
+                }
+                throw new Error('Failed to get CSRF token');
             }
 
-            console.log("✅ SUCCESS: Bypass completed!");
-            console.log(`📊 New cookie length: ${setCookie.length} characters`);
-            
-            // Validate the new cookie
-            if (!setCookie.includes('_|WARNING')) {
-                console.warn("⚠️  New cookie may be invalid - missing expected format markers");
+            this.log('CSRF token obtained');
+
+            // Step 2: Call refresh endpoint
+            const refreshResponse = await this.httpClient.post(
+                'https://www.roblox.com/authentication/signoutfromallsessionsandreauthenticate',
+                {},
+                {
+                    headers: {
+                        'X-CSRF-TOKEN': csrfToken,
+                        'Cookie': `.ROBLOSECURITY=${this.originalCookie}`,
+                        'Referer': 'https://www.roblox.com/'
+                    },
+                    validateStatus: () => true
+                }
+            );
+
+            // Handle different responses
+            if (refreshResponse.status === 403) {
+                // Cloud IP block or invalid CSRF
+                const isCloudBlock = refreshResponse.data?.toString().includes('cloud') || 
+                                   refreshResponse.data?.toString().includes('block');
+                throw new Error(isCloudBlock ? 'Cloud IP blocked' : 'CSRF rejected');
             }
 
+            if (refreshResponse.status !== 200) {
+                throw new Error(`HTTP ${refreshResponse.status}`);
+            }
+
+            // Extract new cookie
+            const setCookieHeader = refreshResponse.headers['set-cookie'];
+            if (!setCookieHeader) {
+                throw new Error('No set-cookie header in response');
+            }
+
+            const cookieMatch = Array.isArray(setCookieHeader) 
+                ? setCookieHeader.find(h => h.includes('.ROBLOSECURITY'))
+                : setCookieHeader;
+            
+            const match = cookieMatch.match(/\.ROBLOSECURITY=([^;]+)/);
+            if (!match) {
+                throw new Error('Could not parse new cookie');
+            }
+
+            const newCookie = match[1];
+            this.log('API refresh successful');
+            
             return {
                 success: true,
-                result: setCookie,
-                error: null,
-                details: {
-                    steps_completed: 3,
-                    original_cookie_length: this.cookie?.length || 0,
-                    new_cookie_length: setCookie.length,
-                    csrf_token_length: this.xcsrf_token?.length || 0,
-                    auth_ticket_length: this.rbx_authentication_ticket?.length || 0,
-                    timestamp: new Date().toISOString()
-                }
+                cookie: newCookie,
+                csrfToken: csrfToken,
+                responseStatus: refreshResponse.status
             };
 
         } catch (error) {
-            console.error("💥 CRITICAL ERROR in bypass process:", error.message);
+            this.log('API refresh failed', { error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * METHOD 2: Auth Ticket Method (Your original bypass)
+     * Alternative method if API refresh fails
+     */
+    async authTicketRefresh() {
+        try {
+            // Get CSRF token
+            const csrfResponse = await this.httpClient.post(
+                'https://auth.roblox.com/v2/logout',
+                {},
+                {
+                    headers: { 'Cookie': `.ROBLOSECURITY=${this.originalCookie}` },
+                    validateStatus: () => true
+                }
+            );
+
+            const csrfToken = csrfResponse.headers['x-csrf-token'];
+            if (!csrfToken) {
+                throw new Error('No CSRF token for auth ticket method');
+            }
+
+            // Get authentication ticket
+            const ticketResponse = await this.httpClient.post(
+                'https://auth.roblox.com/v1/authentication-ticket',
+                {},
+                {
+                    headers: {
+                        'X-CSRF-TOKEN': csrfToken,
+                        'RBXAuthenticationNegotiation': '1',
+                        'Referer': 'https://www.roblox.com/camel',
+                        'Content-Type': 'application/json',
+                        'Cookie': `.ROBLOSECURITY=${this.originalCookie}`
+                    },
+                    validateStatus: () => true
+                }
+            );
+
+            const authTicket = ticketResponse.headers['rbx-authentication-ticket'];
+            if (!authTicket) {
+                throw new Error('No authentication ticket received');
+            }
+
+            // Redeem ticket
+            const redeemResponse = await this.httpClient.post(
+                'https://auth.roblox.com/v1/authentication-ticket/redeem',
+                { authenticationTicket: authTicket },
+                {
+                    headers: {
+                        'RBXAuthenticationNegotiation': '1',
+                        'Content-Type': 'application/json'
+                    },
+                    validateStatus: () => true
+                }
+            );
+
+            // Extract cookie
+            const setCookieHeader = redeemResponse.headers['set-cookie'];
+            if (!setCookieHeader) {
+                throw new Error('No cookie from ticket redemption');
+            }
+
+            const cookieMatch = Array.isArray(setCookieHeader) 
+                ? setCookieHeader.find(h => h.includes('.ROBLOSECURITY'))
+                : setCookieHeader;
+            
+            const match = cookieMatch.match(/\.ROBLOSECURITY=([^;]+)/);
+            if (!match) {
+                throw new Error('Could not parse cookie from ticket');
+            }
+
+            this.log('Auth ticket method successful');
             
             return {
-                success: false,
-                result: null,
-                error: error.message,
-                details: {
-                    step: error.step || "unknown",
-                    csrf_token_obtained: !!this.xcsrf_token,
-                    auth_ticket_obtained: !!this.rbx_authentication_ticket,
-                    stack_trace: error.stack
-                }
+                success: true,
+                cookie: match[1],
+                method: 'authTicket'
             };
+
+        } catch (error) {
+            this.log('Auth ticket method failed', { error: error.message });
+            throw error;
         }
     }
 
     /**
-     * Fetch CSRF token with retry logic
-     * @returns {Promise<string|null>}
+     * METHOD 3: Legacy/Simple Validation Refresh
+     * Sometimes just validating the cookie gets a fresh one
      */
-    async getCsrfToken() {
-        const maxAttempts = this.attempts.csrf;
+    async legacyRefresh() {
+        try {
+            // Simple validation request that might refresh session
+            const response = await this.httpClient.get(
+                'https://users.roblox.com/v1/users/authenticated',
+                {
+                    headers: { 'Cookie': `.ROBLOSECURITY=${this.originalCookie}` },
+                    validateStatus: () => true
+                }
+            );
+
+            const setCookieHeader = response.headers['set-cookie'];
+            if (setCookieHeader) {
+                const cookieMatch = Array.isArray(setCookieHeader) 
+                    ? setCookieHeader.find(h => h.includes('.ROBLOSECURITY'))
+                    : setCookieHeader;
+                
+                const match = cookieMatch?.match(/\.ROBLOSECURITY=([^;]+)/);
+                if (match && match[1] !== this.originalCookie) {
+                    this.log('Legacy refresh got new cookie');
+                    return {
+                        success: true,
+                        cookie: match[1],
+                        method: 'legacy'
+                    };
+                }
+            }
+
+            // If no new cookie but request succeeded, return original
+            if (response.status === 200) {
+                this.log('Legacy method validated cookie (no refresh)');
+                return {
+                    success: true,
+                    cookie: this.originalCookie,
+                    method: 'legacy_original'
+                };
+            }
+
+            throw new Error(`Validation failed: HTTP ${response.status}`);
+
+        } catch (error) {
+            this.log('Legacy refresh failed', { error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Retry wrapper for methods
+     */
+    async withRetry(fn, methodName, retries = this.options.maxRetries) {
+        let lastError;
         
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            console.log(`\n🔄 CSRF Attempt ${attempt}/${maxAttempts}...`);
-            
+        for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-                const response = await axios.post(
-                    "https://auth.roblox.com/v2/logout",
-                    {}, // Empty body
-                    {
-                        headers: {
-                            "Cookie": `.ROBLOSECURITY=${this.cookie}`,
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                        },
-                        validateStatus: function (status) {
-                            // Accept all status codes, we'll handle them manually
-                            return true;
-                        }
-                    }
-                );
-
-                console.log(`📡 Response Status: ${response.status}`);
-                console.log(`📡 Response Headers:`, Object.keys(response.headers).join(', '));
-
-                // Check if we got a CSRF token in the headers
-                const csrfToken = response.headers['x-csrf-token'];
-                
-                if (csrfToken) {
-                    console.log(`✅ CSRF Token found in headers (${csrfToken.length} chars)`);
-                    return csrfToken;
-                }
-
-                // Handle different status codes
-                if (response.status === 200) {
-                    console.warn("⚠️  Logout succeeded without CSRF token - unusual behavior");
-                    console.log("📋 Response data:", JSON.stringify(response.data, null, 2));
-                } else if (response.status === 401 || response.status === 403) {
-                    console.warn(`🔒 Authentication issue (${response.status})`);
-                    
-                    // Check for specific error messages
-                    if (response.data && response.data.errors) {
-                        const errors = response.data.errors;
-                        errors.forEach(err => {
-                            console.log(`📋 Roblox Error: ${err.code} - ${err.message}`);
-                            if (err.code === 0) {
-                                console.warn("⚠️  This usually indicates an invalid or expired cookie");
-                            }
-                        });
-                    }
-                    
-                    // Check for cloud IP block
-                    if (response.data && response.data.includes("cloud") || 
-                        response.data && response.data.includes("proxy") ||
-                        response.data && response.data.includes("suspicious")) {
-                        console.error("☁️  CLOUD IP DETECTED: Roblox may be blocking cloud/VPS IP addresses");
-                        console.error("💡 Try running from a residential IP or different location");
-                    }
-                } else {
-                    console.warn(`⚠️  Unexpected status code: ${response.status}`);
-                }
-
-                // Wait before retry (exponential backoff)
-                if (attempt < maxAttempts) {
-                    const waitTime = attempt * 1000; // 1s, 2s, 3s...
-                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-
+                this.log(`Retry attempt ${attempt}/${retries} for ${methodName}`);
+                return await fn();
             } catch (error) {
-                this.handleRequestError(error, "getCsrfToken", attempt, maxAttempts);
+                lastError = error;
+                this.log(`Attempt ${attempt} failed`, { error: error.message });
                 
-                // Wait before retry
-                if (attempt < maxAttempts) {
-                    const waitTime = attempt * 1000;
-                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                if (attempt < retries) {
+                    // Exponential backoff
+                    await new Promise(resolve => 
+                        setTimeout(resolve, Math.pow(2, attempt) * 1000)
+                    );
                 }
             }
         }
-
-        console.error(`❌ Failed to get CSRF token after ${maxAttempts} attempts`);
-        return null;
+        
+        throw lastError;
     }
 
     /**
-     * Get RBX Authentication Ticket
-     * @returns {Promise<string|null>}
+     * Logging utility
      */
-    async getRbxAuthenticationTicket() {
-        if (!this.xcsrf_token) {
-            console.error("❌ Cannot get auth ticket without CSRF token");
-            return null;
-        }
-
-        const maxAttempts = this.attempts.ticket;
+    log(message, data = null) {
+        const entry = {
+            timestamp: new Date().toISOString(),
+            message,
+            ...(data && { data })
+        };
         
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            console.log(`\n🎫 Auth Ticket Attempt ${attempt}/${maxAttempts}...`);
-            
-            try {
-                const response = await axios.post(
-                    "https://auth.roblox.com/v1/authentication-ticket",
-                    {}, // Empty body
-                    {
-                        headers: {
-                            "x-csrf-token": this.xcsrf_token,
-                            "rbxauthenticationnegotiation": "1",
-                            "referer": "https://www.roblox.com/camel",
-                            "Content-Type": "application/json",
-                            "Cookie": `.ROBLOSECURITY=${this.cookie}`,
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                        },
-                        validateStatus: function (status) {
-                            return true;
-                        }
-                    }
-                );
-
-                console.log(`📡 Response Status: ${response.status}`);
-                
-                // Extract ticket from headers
-                const ticket = response.headers['rbx-authentication-ticket'];
-                
-                if (ticket) {
-                    console.log(`✅ Auth Ticket obtained (${ticket.length} chars)`);
-                    return ticket;
-                }
-
-                // Handle different status codes
-                if (response.status === 200) {
-                    console.warn("⚠️  Got 200 but no auth ticket in headers");
-                    console.log("📋 Headers received:", Object.keys(response.headers).join(', '));
-                } else if (response.status === 403) {
-                    console.error("🔒 403 Forbidden - CSRF token may be invalid or expired");
-                    
-                    // Check response for more details
-                    if (response.data && response.data.errors) {
-                        response.data.errors.forEach(err => {
-                            console.log(`📋 Roblox Error: ${err.code} - ${err.message}`);
-                        });
-                    }
-                    
-                    // Check for specific block messages
-                    if (response.data && typeof response.data === 'string') {
-                        if (response.data.includes("captcha") || response.data.includes("bot")) {
-                            console.error("🤖 CAPTCHA/BOT DETECTION: Roblox may be requiring verification");
-                        }
-                    }
-                } else if (response.status === 401) {
-                    console.error("🔐 401 Unauthorized - Cookie is invalid or expired");
-                } else {
-                    console.warn(`⚠️  Unexpected status: ${response.status}`);
-                    console.log("📋 Response data:", JSON.stringify(response.data, null, 2));
-                }
-
-                // Wait before retry
-                if (attempt < maxAttempts) {
-                    const waitTime = attempt * 1000;
-                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-
-            } catch (error) {
-                this.handleRequestError(error, "getRbxAuthenticationTicket", attempt, maxAttempts);
-                
-                // Wait before retry
-                if (attempt < maxAttempts) {
-                    const waitTime = attempt * 1000;
-                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-            }
-        }
-
-        console.error(`❌ Failed to get auth ticket after ${maxAttempts} attempts`);
-        return null;
-    }
-
-    /**
-     * Redeem authentication ticket for new cookie
-     * @returns {Promise<string|null>}
-     */
-    async getSetCookie() {
-        if (!this.rbx_authentication_ticket) {
-            console.error("❌ Cannot redeem without authentication ticket");
-            return null;
-        }
-
-        const maxAttempts = this.attempts.redeem;
-        
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            console.log(`\n🔄 Redeem Attempt ${attempt}/${maxAttempts}...`);
-            
-            try {
-                const response = await axios.post(
-                    "https://auth.roblox.com/v1/authentication-ticket/redeem",
-                    {
-                        authenticationTicket: this.rbx_authentication_ticket
-                    },
-                    {
-                        headers: {
-                            "rbxauthenticationnegotiation": "1",
-                            "Content-Type": "application/json",
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                        },
-                        validateStatus: function (status) {
-                            return true;
-                        }
-                    }
-                );
-
-                console.log(`📡 Response Status: ${response.status}`);
-                
-                // Check for set-cookie header
-                const setCookieHeader = response.headers['set-cookie'];
-                
-                if (setCookieHeader) {
-                    console.log(`📦 Set-Cookie header found (${setCookieHeader.length} chars)`);
-                    
-                    // Extract .ROBLOSECURITY cookie
-                    const cookieMatch = setCookieHeader.match(/\.ROBLOSECURITY=([^;]+)/);
-                    
-                    if (cookieMatch && cookieMatch[1]) {
-                        console.log(`✅ New cookie extracted (${cookieMatch[1].length} chars)`);
-                        return cookieMatch[1];
-                    }
-                    
-                    // Alternative extraction method
-                    const cookies = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
-                    for (const cookieStr of cookies) {
-                        if (cookieStr.includes('.ROBLOSECURITY')) {
-                            const extracted = cookieStr.split('.ROBLOSECURITY=')[1]?.split(';')[0];
-                            if (extracted) {
-                                console.log(`✅ New cookie extracted via alternative method (${extracted.length} chars)`);
-                                return extracted;
-                            }
-                        }
-                    }
-                }
-
-                // Handle different status codes
-                if (response.status === 200) {
-                    console.warn("⚠️  Got 200 but no set-cookie header");
-                    console.log("📋 Headers:", Object.keys(response.headers).join(', '));
-                    
-                    // Check for authentication errors in response
-                    if (response.data && response.data.errors) {
-                        response.data.errors.forEach(err => {
-                            console.log(`📋 Roblox Error: ${err.code} - ${err.message}`);
-                            if (err.code === 3) {
-                                console.error("🔐 Authentication ticket is invalid or expired");
-                            }
-                        });
-                    }
-                } else if (response.status === 403) {
-                    console.error("🔒 403 Forbidden - Authentication ticket rejected");
-                    
-                    // Check for cloud IP block
-                    if (response.data && typeof response.data === 'string' && 
-                        (response.data.includes("cloud") || response.data.includes("proxy"))) {
-                        console.error("☁️  STRONG CLOUD IP DETECTION: Roblox is blocking this request");
-                        console.error("💡 This IP/VPS is likely blacklisted by Roblox");
-                    }
-                } else {
-                    console.warn(`⚠️  Unexpected status: ${response.status}`);
-                    console.log("📋 Response data:", JSON.stringify(response.data, null, 2));
-                }
-
-                // Wait before retry
-                if (attempt < maxAttempts) {
-                    const waitTime = attempt * 1000;
-                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-
-            } catch (error) {
-                this.handleRequestError(error, "getSetCookie", attempt, maxAttempts);
-                
-                // Wait before retry
-                if (attempt < maxAttempts) {
-                    const waitTime = attempt * 1000;
-                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-            }
-        }
-
-        console.error(`❌ Failed to redeem ticket after ${maxAttempts} attempts`);
-        return null;
-    }
-
-    /**
-     * Handle HTTP request errors with detailed logging
-     * @param {Error} error - The error object
-     * @param {string} step - Which step failed
-     * @param {number} attempt - Current attempt number
-     * @param {number} maxAttempts - Maximum attempts
-     */
-    handleRequestError(error, step, attempt, maxAttempts) {
-        console.error(`\n💥 Error in ${step} (Attempt ${attempt}/${maxAttempts}):`);
-        
-        if (error.response) {
-            // The request was made and the server responded with a status code
-            console.error(`📡 Status: ${error.response.status}`);
-            console.error(`📋 Headers:`, error.response.headers);
-            
-            if (error.response.data) {
-                console.error(`📄 Response Data:`, 
-                    typeof error.response.data === 'object' 
-                        ? JSON.stringify(error.response.data, null, 2)
-                        : error.response.data
-                );
-            }
-            
-            // Check for cloud IP indicators
-            const responseData = error.response.data;
-            if (responseData && typeof responseData === 'string') {
-                const cloudIndicators = ['cloud', 'proxy', 'vpn', 'suspicious', 'bot', 'automated'];
-                if (cloudIndicators.some(indicator => responseData.toLowerCase().includes(indicator))) {
-                    console.error("☁️  CLOUD/VPN IP DETECTED IN ERROR RESPONSE");
-                }
-            }
-            
-        } else if (error.request) {
-            // The request was made but no response was received
-            console.error("📡 No response received - Network error");
-            console.error("🔗 Request details:", error.request);
-            
-            // Check for DNS or connectivity issues
-            if (error.code === 'ENOTFOUND') {
-                console.error("🌐 DNS resolution failed - Check internet connection");
-            } else if (error.code === 'ECONNREFUSED') {
-                console.error("🚫 Connection refused - Roblox servers may be down");
-            } else if (error.code === 'ETIMEDOUT') {
-                console.error("⏰ Request timeout - Network latency or server issues");
-            }
-        } else {
-            // Something happened in setting up the request
-            console.error("⚙️  Setup error:", error.message);
-        }
-        
-        console.error("🔧 Full error:", error.message);
-    }
-
-    /**
-     * Configure retry attempts for different steps
-     * @param {Object} config - Configuration object
-     * @param {number} config.csrf - CSRF token attempts
-     * @param {number} config.ticket - Auth ticket attempts
-     * @param {number} config.redeem - Redeem attempts
-     */
-    configureAttempts(config) {
-        if (config.csrf && config.csrf > 0) this.attempts.csrf = config.csrf;
-        if (config.ticket && config.ticket > 0) this.attempts.ticket = config.ticket;
-        if (config.redeem && config.redeem > 0) this.attempts.redeem = config.redeem;
-        
-        console.log("⚙️  Retry configuration updated:");
-        console.log(`   CSRF attempts: ${this.attempts.csrf}`);
-        console.log(`   Ticket attempts: ${this.attempts.ticket}`);
-        console.log(`   Redeem attempts: ${this.attempts.redeem}`);
+        this.attemptLog.push(entry);
+        console.log(`[${entry.timestamp}] ${message}`, data ? JSON.stringify(data) : '');
     }
 }
 
 /**
- * Utility function to validate a cookie
- * @param {string} cookie - Cookie to validate
- * @returns {Object} Validation result
+ * Convenience function for quick refresh
  */
-function validateCookie(cookie) {
-    const result = {
-        isValid: false,
-        issues: [],
-        warnings: [],
-        details: {
-            length: cookie?.length || 0,
-            hasWarningMarker: false,
-            hasSecureFlag: false,
-            format: 'unknown'
-        }
-    };
-
-    if (!cookie) {
-        result.issues.push("Cookie is empty or null");
-        return result;
-    }
-
-    if (cookie.length < 100) {
-        result.issues.push(`Cookie is too short (${cookie.length} chars, expected ~400+)`);
-    }
-
-    if (cookie.includes('_|WARNING')) {
-        result.details.hasWarningMarker = true;
-        result.details.format = 'modern';
-    } else {
-        result.warnings.push("Cookie missing modern warning markers - may be old format");
-    }
-
-    if (cookie.includes('Secure')) {
-        result.details.hasSecureFlag = true;
-    }
-
-    result.isValid = result.issues.length === 0;
-    return result;
+async function refreshCookie(cookie, options = {}) {
+    const refresher = new CookieRefresher(cookie, options);
+    return await refresher.refresh();
 }
 
 /**
- * Main execution function (if run directly)
+ * Validate if a cookie is still active
  */
-async function main() {
-    const args = process.argv.slice(2);
-    
-    if (args.length === 0) {
-        console.log("Usage: node bypass.js <ROBLOSECURITY_COOKIE>");
-        console.log("\nExample:");
-        console.log('  node bypass.js "_|WARNING:-DO-NOT-SHARE-THIS...your_cookie_here"');
-        return;
-    }
+async function validateCookie(cookie, options = {}) {
+    const client = axios.create({
+        timeout: options.timeout || 5000,
+        headers: {
+            'User-Agent': options.userAgent || 'Mozilla/5.0'
+        }
+    });
 
-    const cookie = args[0];
-    const validation = validateCookie(cookie);
-    
-    console.log("🔍 Cookie Validation Results:");
-    console.log(`   Valid: ${validation.isValid ? '✅' : '❌'}`);
-    console.log(`   Length: ${validation.details.length} characters`);
-    console.log(`   Format: ${validation.details.format}`);
-    
-    if (validation.issues.length > 0) {
-        console.log("\n❌ Issues found:");
-        validation.issues.forEach(issue => console.log(`   - ${issue}`));
-    }
-    
-    if (validation.warnings.length > 0) {
-        console.log("\n⚠️  Warnings:");
-        validation.warnings.forEach(warning => console.log(`   - ${warning}`));
-    }
+    try {
+        const response = await client.get(
+            'https://users.roblox.com/v1/users/authenticated',
+            {
+                headers: { 'Cookie': `.ROBLOSECURITY=${cookie}` },
+                validateStatus: () => true
+            }
+        );
 
-    console.log("\n" + "=".repeat(50));
-    
-    const bypass = new Bypass(cookie);
-    
-    // Optional: Configure retry attempts
-    // bypass.configureAttempts({ csrf: 5, ticket: 3, redeem: 3 });
-    
-    const result = await bypass.startProcess();
-    
-    console.log("\n" + "=".repeat(50));
-    console.log("📊 FINAL RESULTS:");
-    console.log(`   Success: ${result.success ? '✅' : '❌'}`);
-    
-    if (result.success) {
-        console.log(`   New Cookie: ${result.result.substring(0, 50)}...`);
-        console.log(`   Length: ${result.result.length} characters`);
-        
-        // Save to file example
-        // const fs = require('fs');
-        // fs.writeFileSync('new_cookie.txt', result.result);
-        // console.log("💾 Cookie saved to new_cookie.txt");
-    } else {
-        console.log(`   Error: ${result.error}`);
-        console.log(`   Details:`, result.details);
-    }
-    
-    return result;
-}
-
-// Export both the class and utility functions
-module.exports = {
-    Bypass,
-    validateCookie,
-    // Legacy function exports for compatibility
-    generateAuthTicket: async function(roblosecurityCookie) {
-        const bypass = new Bypass(roblosecurityCookie);
-        await bypass.getCsrfToken();
-        return await bypass.getRbxAuthenticationTicket();
-    },
-    redeemAuthTicket: async function(authTicket) {
-        // Note: This requires creating a new Bypass instance with a dummy cookie
-        const bypass = new Bypass('');
-        bypass.rbx_authentication_ticket = authTicket;
-        const newCookie = await bypass.getSetCookie();
         return {
-            success: !!newCookie,
-            refreshedCookie: newCookie,
-            robloxDebugResponse: newCookie ? null : "Failed to redeem ticket"
+            valid: response.status === 200,
+            status: response.status,
+            userId: response.data?.id || null,
+            username: response.data?.name || null,
+            ...(response.status !== 200 && { error: response.data })
+        };
+    } catch (error) {
+        return {
+            valid: false,
+            error: error.message
         };
     }
+}
+
+/**
+ * Parse proxy string (supports multiple formats)
+ */
+function parseProxyString(proxyString) {
+    if (!proxyString) return null;
+    
+    // Format: socks5://user:pass@host:port
+    // Format: http://host:port
+    // Format: host:port (defaults to http)
+    
+    try {
+        let url;
+        if (proxyString.includes('://')) {
+            url = new URL(proxyString);
+        } else {
+            url = new URL(`http://${proxyString}`);
+        }
+        
+        return {
+            host: url.hostname,
+            port: parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80),
+            type: url.protocol.replace(':', ''),
+            username: url.username || null,
+            password: url.password || null
+        };
+    } catch (error) {
+        console.error('Failed to parse proxy string:', error.message);
+        return null;
+    }
+}
+
+// Export everything
+module.exports = {
+    CookieRefresher,
+    refreshCookie,
+    validateCookie,
+    parseProxyString
 };
 
-// Run main if this file is executed directly
+/**
+ * Example usage at the bottom (remove in production)
+ */
 if (require.main === module) {
-    main().catch(console.error);
+    (async () => {
+        console.log('=== Cookie Refresher Example ===\n');
+        
+        // Example 1: Basic usage
+        const exampleCookie = 'YOUR_COOKIE_HERE'; // Replace with actual cookie
+        
+        // Example 2: With proxy
+        const result = await refreshCookie(exampleCookie, {
+            proxy: parseProxyString('socks5://user:pass@proxy-host:1080'),
+            timeout: 15000
+        });
+        
+        console.log('\n=== Result ===');
+        console.log(`Success: ${result.success}`);
+        console.log(`Method: ${result.method}`);
+        console.log(`Cookie length: ${result.cookie?.length || 0} chars`);
+        console.log(`Attempts: ${result.logs?.length || 0}`);
+        
+        // Example 3: Validate the result
+        if (result.success) {
+            const validation = await validateCookie(result.cookie);
+            console.log(`\nValidation: ${validation.valid ? 'VALID' : 'INVALID'}`);
+            if (validation.valid) {
+                console.log(`User: ${validation.username} (ID: ${validation.userId})`);
+            }
+        }
+    })();
 }
