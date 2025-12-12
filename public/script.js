@@ -5,28 +5,38 @@ document.addEventListener("DOMContentLoaded", function () {
     const resultElement = document.getElementById("result");
     const countdownElement = document.getElementById("countdown");
     const copyButton = document.getElementById("copyButton");
-    const statusElement = document.getElementById("status");
+    const statusElement = document.createElement("div");
+    
+    // Add status element after result
+    resultElement.parentNode.insertBefore(statusElement, resultElement.nextSibling);
+    statusElement.id = "status";
+    statusElement.style.marginTop = "10px";
+    statusElement.style.fontSize = "14px";
 
     refreshButton.addEventListener("click", function () {
         const authCookie = authCookieInput.value.trim();
         
         if (!authCookie) {
             resultElement.textContent = "Please enter a cookie first!";
+            statusElement.textContent = "";
             return;
         }
 
         refreshButton.disabled = true;
         refreshButtonIcon.classList.add("rotate-icon");
-        resultElement.textContent = "Please wait, your cookie is being processed...";
-        if (statusElement) statusElement.textContent = "";
+        resultElement.textContent = "Processing your cookie...";
+        statusElement.textContent = "";
+        statusElement.style.color = "blue";
 
-        let countdown = 7;
+        let countdown = 5; // Reduced from 7
         countdownElement.textContent = `Processing in ${countdown} seconds...`;
 
         const countdownInterval = setInterval(() => {
             countdown--;
-            if (countdown >= 0) {
+            if (countdown > 0) {
                 countdownElement.textContent = `Processing in ${countdown} second${countdown !== 1 ? 's' : ''}...`;
+            } else if (countdown === 0) {
+                countdownElement.textContent = "Processing now...";
             } else {
                 clearInterval(countdownInterval);
                 countdownElement.textContent = "";
@@ -35,77 +45,83 @@ document.addEventListener("DOMContentLoaded", function () {
 
         setTimeout(() => {
             fetch("/refresh?cookie=" + encodeURIComponent(authCookie))
-                .then((response) => {
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-                    return response.json();
-                })
+                .then((response) => response.json())
                 .then((data) => {
-                    console.log('Response data:', data);
+                    console.log('Server response:', data);
                     
-                    // Handle the new response format
-                    if (data.success) {
-                        resultElement.textContent = data.cookie;
-                        if (statusElement) {
-                            statusElement.textContent = `✅ Success! Method: ${data.method}`;
-                            statusElement.style.color = "green";
-                        }
-                    } else if (data.cookie) {
-                        // Even if not successful, we got a cookie (original as fallback)
-                        resultElement.textContent = data.cookie;
-                        if (statusElement) {
-                            statusElement.textContent = `⚠️ Using original cookie: ${data.message}`;
-                            statusElement.style.color = "orange";
-                        }
-                    } else {
-                        resultElement.textContent = "Failed to process cookie";
-                        if (statusElement) {
-                            statusElement.textContent = "❌ Error: No cookie returned";
-                            statusElement.style.color = "red";
-                        }
+                    // Handle both response formats (old and new)
+                    let finalCookie = "";
+                    let successMessage = "";
+                    
+                    // Check for new format first
+                    if (data.cookie) {
+                        finalCookie = data.cookie;
+                        successMessage = data.validation?.valid 
+                            ? "✅ Cookie is valid" 
+                            : "⚠️ Cookie may be invalid";
+                    }
+                    // Check for old format
+                    else if (data.redemptionResult?.refreshedCookie) {
+                        finalCookie = data.redemptionResult.refreshedCookie;
+                        successMessage = data.redemptionResult.success 
+                            ? "✅ Cookie processed" 
+                            : "⚠️ Original cookie returned";
+                    }
+                    // Fallback
+                    else {
+                        finalCookie = authCookie;
+                        successMessage = "⚠️ No response, using original";
+                    }
+                    
+                    // Display results
+                    resultElement.textContent = finalCookie;
+                    statusElement.textContent = successMessage;
+                    statusElement.style.color = successMessage.includes("✅") ? "green" : "orange";
+                    
+                    // Auto-copy to clipboard if successful
+                    if (successMessage.includes("✅")) {
+                        navigator.clipboard.writeText(finalCookie).then(() => {
+                            copyButton.textContent = "Auto-copied!";
+                            setTimeout(() => (copyButton.textContent = "Copy"), 2000);
+                        });
                     }
                 })
                 .catch((error) => {
-                    console.error('Fetch error:', error);
-                    resultElement.textContent = "Error occurred while processing. The server might be down.";
-                    if (statusElement) {
-                        statusElement.textContent = "❌ Network error";
-                        statusElement.style.color = "red";
-                    }
+                    console.error('Error:', error);
+                    resultElement.textContent = authCookie; // Always show original
+                    statusElement.textContent = "⚠️ Server error, using original cookie";
+                    statusElement.style.color = "red";
                 })
                 .finally(() => {
                     refreshButton.disabled = false;
                     refreshButtonIcon.classList.remove("rotate-icon");
                 });
-        }, 7000);
+        }, 5000); // Reduced wait time
     });
 
     // Copy Button
     copyButton.addEventListener("click", function () {
         const textToCopy = resultElement.textContent.trim();
-        if (!textToCopy || textToCopy.includes("Please") || textToCopy.includes("Error") || textToCopy.includes("Failed")) {
+        if (!textToCopy || textToCopy === "Processing your cookie..." || textToCopy.includes("Please")) {
             return;
         }
 
         navigator.clipboard.writeText(textToCopy).then(() => {
             const originalText = copyButton.textContent;
             copyButton.textContent = "Copied!";
-            setTimeout(() => (copyButton.textContent = originalText), 1000);
+            setTimeout(() => (copyButton.textContent = originalText), 2000);
         }).catch(() => {
-            // Fallback
+            // Fallback for old browsers
             const textarea = document.createElement("textarea");
             textarea.value = textToCopy;
-            textarea.style.position = "fixed";
-            textarea.style.left = "-9999px";
             document.body.appendChild(textarea);
             textarea.select();
             document.execCommand("copy");
             document.body.removeChild(textarea);
-
+            
             const originalText = copyButton.textContent;
             copyButton.textContent = "Copied!";
-            setTimeout(() => (copyButton.textContent = originalText), 1000);
+            setTimeout(() => (copyButton.textContent = originalText), 2000);
         });
     });
 });
