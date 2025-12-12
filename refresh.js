@@ -360,18 +360,22 @@ class CookieRefresher {
     }
 
     /**
-     * Logging utility
-     */
-    log(message, data = null) {
-        const entry = {
-            timestamp: new Date().toISOString(),
-            message,
-            ...(data && { data })
-        };
-        
-        this.attemptLog.push(entry);
-        console.log(`[${entry.timestamp}] ${message}`, data ? JSON.stringify(data) : '');
+ * Logging utility - FIXED VERSION
+ */
+log(message, data = null) {
+    // Initialize attemptLog if it doesn't exist
+    if (!this.attemptLog) {
+        this.attemptLog = [];
     }
+    
+    const entry = {
+        timestamp: new Date().toISOString(),
+        message,
+        ...(data && { data })
+    };
+    
+    this.attemptLog.push(entry);
+    console.log(`[${entry.timestamp}] ${message}`, data ? JSON.stringify(data) : '');
 }
 
 /**

